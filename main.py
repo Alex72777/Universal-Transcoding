@@ -23,9 +23,20 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, List, Optional
 
-import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
-from tkinter.scrolledtext import ScrolledText
+try:
+    import tkinter as tk
+    from tkinter import filedialog, messagebox, ttk
+    from tkinter.scrolledtext import ScrolledText
+    _HAS_TK = True
+except ImportError:
+    _HAS_TK = False
+    # Stub names so the module parses cleanly; App is never instantiated
+    # without tkinter, so method bodies that reference these never run.
+    tk = None          # type: ignore[assignment]
+    ttk = None         # type: ignore[assignment]
+    filedialog = None  # type: ignore[assignment]
+    messagebox = None  # type: ignore[assignment]
+    ScrolledText = None  # type: ignore[assignment]
 
 # ──────────────────────────────────────────────────────────────────── meta ───
 
@@ -607,9 +618,15 @@ class CLIHandler:
             ))
 
 
+# _AppBase is tk.Tk when tkinter is available, plain object otherwise.
+# The App class body is always parsed, but its methods reference tk/ttk
+# only at call-time, so they are never executed without tkinter.
+_AppBase: type = tk.Tk if _HAS_TK else object  # type: ignore[union-attr]
+
+
 # ──────────────────────────────────────────────────────────────────── App ────
 
-class App(tk.Tk):
+class App(_AppBase):  # type: ignore[misc]
     def __init__(self) -> None:
         super().__init__()
         self.title(f"{APP_NAME}  v{VERSION}")
@@ -1253,14 +1270,39 @@ def run_cli(args: argparse.Namespace) -> int:
 
 # ────────────────────────────────────────────────────────────────────── entry ───
 
+def _has_display() -> bool:
+    """Return True if a graphical display is reachable."""
+    if platform.system() in ("Windows", "Darwin"):
+        return True
+    # Linux / BSD: check for X11 or Wayland
+    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+
+
 def main() -> None:
     if len(sys.argv) > 1:
-        # Any argument triggers CLI mode — tkinter is not touched.
+        # Any argument → CLI mode.  tkinter is never imported or touched.
         sys.exit(run_cli(_parse_args()))
 
-    # No arguments → launch the GUI.
-    app = App()
-    app.mainloop()
+    # No arguments → GUI mode.  Validate the environment first.
+    if not _HAS_TK:
+        print(
+            f"{APP_NAME}: tkinter is not available.\n"
+            "Install it (e.g. 'apt install python3-tk') or use CLI mode.\n"
+            "Run with --help for CLI usage.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    if not _has_display():
+        print(
+            f"{APP_NAME}: no display found ($DISPLAY / $WAYLAND_DISPLAY not set).\n"
+            "Use CLI mode in headless environments.\n"
+            "Run with --help for CLI usage.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    App().mainloop()
 
 
 if __name__ == "__main__":

@@ -8,6 +8,8 @@ other web-based file server).
 
 ## Requirements
 
+### Running from source
+
 | Dependency | Notes |
 |---|---|
 | **Python 3.8+** | Must include `tkinter` for GUI mode (see below) |
@@ -15,6 +17,12 @@ other web-based file server).
 | **ffprobe** | Bundled with ffmpeg, also needs to be in `PATH` |
 
 No extra Python packages are needed — only the standard library is used.
+
+### Running as a standalone executable
+
+If you build the app with PyInstaller (see [Building a standalone
+executable](#building-a-standalone-executable)), **Python and tkinter are
+bundled inside the binary** — end users only need FFmpeg in their PATH.
 
 ### Installing FFmpeg
 
@@ -24,13 +32,69 @@ No extra Python packages are needed — only the standard library is used.
 - **Windows:** Download from <https://ffmpeg.org/download.html> and add the
   `bin/` folder to your `PATH`
 
-### tkinter note
+### tkinter note (source only)
 
 `tkinter` is only required for **GUI mode**. CLI mode works without it.
 On some Linux distros it is a separate package:
 
 - **Debian/Ubuntu:** `sudo apt install python3-tk`
 - **Arch:** `sudo pacman -S tk`
+
+---
+
+## Building a standalone executable
+
+Use [PyInstaller](https://pyinstaller.org) to produce a single binary that
+bundles Python, tkinter, and the full Tcl/Tk runtime. End users only need
+FFmpeg — no Python installation required.
+
+### 1. Install PyInstaller
+
+```sh
+pip install pyinstaller
+```
+
+### 2. Verify tkinter works on your build machine
+
+```sh
+python -c "import tkinter; tkinter.Tk().destroy(); print('tkinter OK')"
+```
+
+If this fails, install tkinter first (see the *tkinter note* above) before
+building — PyInstaller can only bundle what is present on the build machine.
+
+### 3. Build
+
+```sh
+pyinstaller ul_transcoding.spec
+```
+
+The spec file already handles tkinter collection, module exclusions, and
+the correct console/GUI settings. The resulting binary is written to:
+
+```
+dist/ul-transcoding          # Linux / macOS
+dist/ul-transcoding.exe      # Windows
+```
+
+### Spec file options
+
+Open `ul_transcoding.spec` to adjust:
+
+| Option | Default | Notes |
+|---|---|---|
+| `console` | `True` | Must stay `True` for CLI output. On Windows a console window appears behind the GUI — this is expected. |
+| `upx` | `True` | Compresses the binary with [UPX](https://upx.github.io) if installed. Set to `False` if UPX is not available. |
+| `strip` | `False` | Set to `True` on Linux/macOS to strip debug symbols and reduce size. |
+| `icon` | `None` | Set to `"icon.ico"` (Windows) or `"icon.icns"` (macOS) to add an app icon. |
+| `target_arch` | `None` | Native arch by default. Set to `"x86_64"` or `"arm64"` for cross-compilation. |
+| `optimize` | `1` | Strips docstrings. Safe to increase to `2` for slightly smaller output. |
+
+### Cross-platform note
+
+PyInstaller builds are **platform-specific** — a binary built on Linux runs
+on Linux, Windows on Windows, macOS on macOS. To distribute for multiple
+platforms you must build on each platform separately (or use CI).
 
 ---
 
