@@ -1,8 +1,7 @@
 # UL Transcoding
 
-Universal Live Transcoding tool — converts video files to browser-compatible
-formats for use with [CopyParty](https://github.com/9001/copyparty) (or any
-other web-based file server).
+Universal Transcoding tool — converts video files to browser-compatible
+formats.
 
 ---
 

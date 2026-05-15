@@ -17,6 +17,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -228,6 +229,7 @@ class Job:
     container: str   = ""
     duration:  float = 0.0
     out_size:  int   = 0    # bytes written to dst (filled on success)
+    src_size:  int   = 0    # bytes of src file (filled at scan time)
 
 
 @dataclass
@@ -751,6 +753,18 @@ def _fmt_size(n: int) -> str:
     return f"{n:.1f} PB"
 
 
+def _fmt_eta(secs: float) -> str:
+    """Human-readable ETA, e.g. '3m 12s', '1h 04m', '45s'."""
+    if secs < 0:
+        return "done"
+    s = int(secs)
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m {s % 60:02d}s"
+    return f"{s // 3600}h {(s % 3600) // 60:02d}m"
+
+
 def _copy_file(src: Path, dst: Path) -> None:
     """Copy src → dst. Tries a hard link first (instant on same filesystem),
     falls back to a full byte copy."""
@@ -788,55 +802,93 @@ class CLIHandler:
         "dry":   "\033[96m",    # cyan
         "reset": "\033[0m",
     }
+    _BAR_W   = 28   # width of the progress bar in chars
+    _LINE_W  = 90   # chars to blank when erasing the progress line
 
-    def __init__(self, total: int, use_color: bool) -> None:
+    def __init__(self, total: int, total_bytes: int, use_color: bool) -> None:
         self.total          = total
+        self.total_bytes    = total_bytes
         self.n_done         = 0
         self.n_skip         = 0
         self.n_fail         = 0
         self.in_bytes       = 0
         self.out_bytes      = 0
         self._color         = use_color
-        self._in_prog       = False
+        self._bar_active    = False   # True while the progress line is on screen
         self._lock          = threading.Lock()
+        # ETA state (bytes-based for accuracy)
+        self._start_time    = time.monotonic()
+        self._done_bytes    = 0       # bytes from fully completed jobs
+        self._cur_src_bytes = 0       # size of the file currently being encoded
+        self._cur_pct       = 0.0    # encoding progress of the current file
+
+    # ── public ────────────────────────────────────────────────────────────
 
     def handle(self, msg: Msg) -> None:
         with self._lock:
             self._handle(msg)
+
+    # ── internal ──────────────────────────────────────────────────────────
 
     def _c(self, tag: str, text: str) -> str:
         if not self._color or tag not in self._ANSI:
             return text
         return f"{self._ANSI[tag]}{text}{self._ANSI['reset']}"
 
-    def _erase_progress(self) -> None:
-        if self._in_prog:
-            print("\r" + " " * 55 + "\r", end="", flush=True)
-            self._in_prog = False
+    def _erase_bar(self) -> None:
+        if self._bar_active:
+            print("\r" + " " * self._LINE_W + "\r", end="", flush=True)
+            self._bar_active = False
+
+    def _draw_bar(self) -> None:
+        """(Re)draw the persistent overall progress bar in-place."""
+        if self.total_bytes == 0:
+            return
+        processed   = self._done_bytes + int(self._cur_src_bytes * self._cur_pct / 100)
+        overall_pct = min(100.0, processed / self.total_bytes * 100)
+        elapsed     = time.monotonic() - self._start_time
+
+        if processed > 0 and elapsed > 0.5:
+            rate = processed / elapsed
+            eta  = _fmt_eta(max(0, self.total_bytes - processed) / rate)
+        else:
+            eta = "..."
+
+        completed = self.n_done + self.n_skip + self.n_fail
+        w      = self._BAR_W
+        filled = int(w * overall_pct / 100)
+        bar    = "\u2588" * filled + "\u2591" * (w - filled)
+        print(
+            f"\r  [{bar}] {overall_pct:5.1f}%  ETA {eta:<10}  "
+            f"({completed}/{self.total} files)",
+            end="", flush=True,
+        )
+        self._bar_active = True
 
     def _handle(self, msg: Msg) -> None:    # noqa: C901
         job = msg.job
 
         if msg.kind == "log":
-            self._erase_progress()
+            self._erase_bar()
             print(self._c(msg.tag or "", f"[{_ts()}] {msg.text}"))
+            self._draw_bar()
 
         elif msg.kind == "job_start":
-            self._erase_progress()
+            assert job is not None
+            self._erase_bar()
             print(self._c("start", f"[{_ts()}] {msg.text}"))
+            self._cur_src_bytes = job.src_size
+            self._cur_pct       = 0.0
+            self._draw_bar()
 
         elif msg.kind == "job_progress":
             assert job is not None
-            pct    = job.progress
-            w      = 32
-            filled = int(w * pct / 100)
-            bar    = "\u2588" * filled + "\u2591" * (w - filled)
-            print(f"\r  [{bar}] {pct:5.1f}%", end="", flush=True)
-            self._in_prog = True
+            self._cur_pct = job.progress
+            self._draw_bar()
 
         elif msg.kind == "job_done":
             assert job is not None
-            self._erase_progress()
+            self._erase_bar()
 
             if msg.tag and job.status == Status.DONE:
                 tag = msg.tag       # COPY, DRY, or other override
@@ -854,19 +906,22 @@ class CLIHandler:
                 tag = "fail"
                 self.n_fail += 1
 
-            # Track input/output sizes for done jobs
-            if job.status == Status.DONE and not msg.tag == "dry":
-                try:
-                    self.in_bytes += job.src.stat().st_size
-                except OSError:
-                    pass
+            # Advance ETA tracker — credit the full file size as done
+            self._done_bytes    += job.src_size or self._cur_src_bytes
+            self._cur_src_bytes  = 0
+            self._cur_pct        = 0.0
+
+            # Track input/output sizes for final summary
+            if job.status == Status.DONE and msg.tag != "dry":
+                self.in_bytes  += job.src_size
                 self.out_bytes += job.out_size
 
             completed = self.n_done + self.n_skip + self.n_fail
             print(self._c(tag, f"[{_ts()}] {msg.text}  [{completed}/{self.total}]"))
+            self._draw_bar()
 
         elif msg.kind == "all_done":
-            self._erase_progress()
+            self._erase_bar()
             lines = [
                 f"\n\u2500\u2500 All done \u2500\u2500  "
                 f"Converted: {self.n_done}   "
@@ -876,7 +931,7 @@ class CLIHandler:
             if self.in_bytes or self.out_bytes:
                 lines.append(
                     f"Input: {_fmt_size(self.in_bytes)}"
-                    f"  →  Output: {_fmt_size(self.out_bytes)}"
+                    f"  \u2192  Output: {_fmt_size(self.out_bytes)}"
                 )
             print(self._c("info", "\n".join(lines)))
 
@@ -908,6 +963,12 @@ class App(_AppBase):  # type: ignore[misc]
         self._queue:          queue.SimpleQueue[Msg] = queue.SimpleQueue()
         self._n_done = self._n_skip = self._n_fail = 0
         self._in_bytes = self._out_bytes = 0
+        # ETA / bytes-based progress
+        self._total_bytes:    int   = 0
+        self._done_bytes:     int   = 0
+        self._cur_src_bytes:  int   = 0
+        self._cur_pct:        float = 0.0
+        self._run_start:      float = 0.0
 
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -1061,11 +1122,16 @@ class App(_AppBase):  # type: ignore[misc]
         self._bar_overall.pack(side="left", fill="x", expand=True)
         self._bar_overall_lbl = tk.StringVar(value="")
         ttk.Label(overall_row, textvariable=self._bar_overall_lbl,
-                  width=10, anchor="e").pack(side="left", padx=(6, 0))
+                  width=7, anchor="e").pack(side="left", padx=(6, 0))
+
+        # ETA / file-count row
+        self._eta_var = tk.StringVar(value="")
+        ttk.Label(pf2, textvariable=self._eta_var,
+                  anchor="w", foreground="#888888").pack(fill="x", pady=(1, 0))
 
         self._cur_var = tk.StringVar(value="")
         ttk.Label(pf2, textvariable=self._cur_var,
-                  anchor="w", foreground="#666666").pack(fill="x", pady=(2, 0))
+                  anchor="w", foreground="#666666").pack(fill="x", pady=(1, 0))
 
         file_row = ttk.Frame(pf2)
         file_row.pack(fill="x", pady=(2, 0))
@@ -1274,16 +1340,24 @@ class App(_AppBase):  # type: ignore[misc]
             out_dir = out_dir  # may be None for in-place
 
         # ── Shared post-scan UI update ─────────────────────────────────────
+        # Fill src_size on every job now, so handlers don't need to re-stat
+        for j in self._jobs:
+            j.src_size = j.src.stat().st_size
+
         self._n_done = self._n_skip = self._n_fail = 0
         self._in_bytes = self._out_bytes = 0
+        self._done_bytes = self._cur_src_bytes = 0
+        self._cur_pct = 0.0
         self._bar_overall["value"]   = 0
-        self._bar_overall["maximum"] = len(self._jobs)
-        self._bar_overall_lbl.set(f"0 / {len(self._jobs)}")
         self._bar_file["value"] = 0
         self._bar_file_lbl.set("")
+        self._eta_var.set("")
         self._cur_var.set("")
 
-        total_bytes = sum(j.src.stat().st_size for j in self._jobs)
+        total_bytes = sum(j.src_size for j in self._jobs)
+        self._total_bytes = total_bytes
+        self._bar_overall["maximum"] = max(total_bytes, 1)
+        self._bar_overall_lbl.set("0.0%")
 
         self._log_clear()
         self._log_write(log_header, "info")
@@ -1326,11 +1400,15 @@ class App(_AppBase):  # type: ignore[misc]
 
         self._n_done = self._n_skip = self._n_fail = 0
         self._in_bytes = self._out_bytes = 0
+        self._done_bytes = self._cur_src_bytes = 0
+        self._cur_pct = 0.0
+        self._run_start = time.monotonic()
         self._bar_overall["value"]   = 0
-        self._bar_overall["maximum"] = len(self._jobs)
-        self._bar_overall_lbl.set(f"0 / {len(self._jobs)}")
+        self._bar_overall["maximum"] = max(self._total_bytes, 1)
+        self._bar_overall_lbl.set("0.0%")
         self._bar_file["value"] = 0
         self._bar_file_lbl.set("")
+        self._eta_var.set("")
 
         flags = []
         if dry_run:   flags.append("DRY RUN")
@@ -1383,7 +1461,29 @@ class App(_AppBase):  # type: ignore[misc]
         self._log_write(f"\n[{_ts()}] Stop requested — waiting for current file…\n", "warn")
         self._btn_stop.config(state="disabled")
 
-    # ── Message polling ───────────────────────────────────────────────────────
+    # ── Overall progress + ETA ──────────────────────────────────────────────
+
+    def _update_overall_bar(self) -> None:
+        """Recompute bytes-based overall % and ETA, then update bar + label."""
+        processed = self._done_bytes + int(self._cur_src_bytes * self._cur_pct / 100)
+        tb = self._total_bytes
+        pct = min(100.0, processed / tb * 100) if tb else 0.0
+        self._bar_overall["value"] = processed
+        self._bar_overall_lbl.set(f"{pct:.1f}%")
+
+        elapsed = time.monotonic() - self._run_start
+        if processed > 0 and elapsed > 0.5:
+            rate = processed / elapsed
+            remaining = max(0, tb - processed)
+            eta_s = _fmt_eta(remaining / rate)
+        else:
+            eta_s = "..."
+
+        completed = self._n_done + self._n_skip + self._n_fail
+        total     = len(self._jobs)
+        self._eta_var.set(f"ETA {eta_s}   ·   {completed} / {total} files")
+
+    # ── Message polling ────────────────────────────────────────────────────────
 
     def _poll(self) -> None:
         try:
@@ -1399,12 +1499,16 @@ class App(_AppBase):  # type: ignore[misc]
         if msg.kind == "log":
             self._log_write(f"[{_ts()}] {msg.text}\n", msg.tag or "")
 
-        elif msg.kind == "job_start":
+        if msg.kind == "job_start":
             assert job is not None
             self._bar_file["value"] = 0
             self._bar_file_lbl.set("0%")
             self._cur_var.set(f"Encoding: {job.src.name}")
             self._log_write(f"[{_ts()}] {msg.text}\n", "start")
+            # Start crediting this file's bytes toward overall progress
+            self._cur_src_bytes = job.src_size
+            self._cur_pct       = 0.0
+            self._update_overall_bar()
 
         elif msg.kind == "job_progress":
             assert job is not None
@@ -1412,6 +1516,8 @@ class App(_AppBase):  # type: ignore[misc]
             self._bar_file["value"] = pct
             self._bar_file_lbl.set(f"{pct:.0f}%")
             self._cur_var.set(f"Encoding: {job.src.name}  ({pct:.1f}%)")
+            self._cur_pct = pct
+            self._update_overall_bar()
 
         elif msg.kind == "job_done":
             assert job is not None
@@ -1420,10 +1526,7 @@ class App(_AppBase):  # type: ignore[misc]
                 self._n_done += 1
                 if msg.tag != "dry":
                     self._out_bytes += job.out_size
-                    try:
-                        self._in_bytes += job.src.stat().st_size
-                    except OSError:
-                        pass
+                    self._in_bytes  += job.src_size
                 self._bar_file["value"] = 100
                 self._bar_file_lbl.set("100%")
             elif msg.tag:
@@ -1436,41 +1539,45 @@ class App(_AppBase):  # type: ignore[misc]
                 tag = "done"
                 self._n_done += 1
                 self._out_bytes += job.out_size
-                try:
-                    self._in_bytes += job.src.stat().st_size
-                except OSError:
-                    pass
+                self._in_bytes  += job.src_size
                 self._bar_file["value"] = 100
                 self._bar_file_lbl.set("100%")
             else:
                 tag = "fail"
                 self._n_fail += 1
 
+            # Graduate this file's bytes into the done bucket
+            self._done_bytes    += job.src_size or self._cur_src_bytes
+            self._cur_src_bytes  = 0
+            self._cur_pct        = 0.0
+
             self._log_write(f"[{_ts()}] {msg.text}\n", tag)
 
             completed = self._n_done + self._n_skip + self._n_fail
-            self._bar_overall["value"] = completed
             total = len(self._jobs)
-            self._bar_overall_lbl.set(f"{completed} / {total}")
             self._stat_var.set(
                 f"{completed} / {total} files   "
-                f"✓ {self._n_done} done   "
-                f"⤏ {self._n_skip} skipped   "
-                f"✗ {self._n_fail} failed"
+                f"\u2713 {self._n_done} done   "
+                f"\u2924 {self._n_skip} skipped   "
+                f"\u2717 {self._n_fail} failed"
             )
+            self._update_overall_bar()
 
         elif msg.kind == "all_done":
             total = len(self._jobs)
             self._cur_var.set("")
             self._bar_file["value"] = 0
             self._bar_file_lbl.set("")
-            self._bar_overall["value"] = total
-            self._bar_overall_lbl.set(f"{total} / {total}")
+            # Snap bar to 100%
+            self._done_bytes    = self._total_bytes
+            self._cur_src_bytes = 0
+            self._update_overall_bar()
+            self._eta_var.set("")
 
             size_line = ""
             if self._in_bytes or self._out_bytes:
                 size_line = (f"  Input: {_fmt_size(self._in_bytes)}"
-                             f"  →  Output: {_fmt_size(self._out_bytes)}\n")
+                             f"  \u2192  Output: {_fmt_size(self._out_bytes)}\n")
 
             self._log_write(
                 f"\n[{_ts()}] \u2500\u2500 All done \u2500\u2500   "
@@ -1481,11 +1588,11 @@ class App(_AppBase):  # type: ignore[misc]
                 "info",
             )
             self._stat_var.set(
-                f"Finished — "
-                f"✓ {self._n_done} converted   "
-                f"⤏ {self._n_skip} skipped   "
-                f"✗ {self._n_fail} failed"
-                + (f"   ({_fmt_size(self._in_bytes)} → {_fmt_size(self._out_bytes)})"
+                f"Finished \u2014 "
+                f"\u2713 {self._n_done} converted   "
+                f"\u2924 {self._n_skip} skipped   "
+                f"\u2717 {self._n_fail} failed"
+                + (f"   ({_fmt_size(self._in_bytes)} \u2192 {_fmt_size(self._out_bytes)})"
                    if self._in_bytes else "")
             )
             self._btn_scan.config(state="normal")
@@ -1535,7 +1642,9 @@ def _collect_jobs(inputs: List[str], out_dir: Optional[Path],
             if p.suffix.lower() in VIDEO_EXTENSIONS and p not in seen:
                 seen.add(p)
                 dst = (p.parent if in_place else out_dir) / p.with_suffix(f".{ext}").name  # type: ignore[operator]
-                jobs.append(Job(src=p, dst=dst))
+                j = Job(src=p, dst=dst)
+                j.src_size = p.stat().st_size
+                jobs.append(j)
         elif p.is_dir():
             pattern = "**/*" if recursive else "*"
             for src in sorted(p.glob(pattern)):
@@ -1547,7 +1656,9 @@ def _collect_jobs(inputs: List[str], out_dir: Optional[Path],
                     else:
                         assert out_dir is not None
                         dst = out_dir / src.relative_to(p).with_suffix(f".{ext}")
-                    jobs.append(Job(src=src, dst=dst))
+                    j = Job(src=src, dst=dst)
+                    j.src_size = src.stat().st_size
+                    jobs.append(j)
         else:
             print(f"Warning: '{raw}' is not a file or directory, skipping.",
                   file=sys.stderr)
@@ -1701,7 +1812,7 @@ def run_cli(args: argparse.Namespace) -> int:
     print()
 
     # ── run worker ────────────────────────────────────────────────────────────
-    handler = CLIHandler(total=len(jobs), use_color=sys.stdout.isatty())
+    handler = CLIHandler(total=len(jobs), total_bytes=total_in, use_color=sys.stdout.isatty())
     done_ev = threading.Event()
 
     def _send(msg: Msg) -> None:
