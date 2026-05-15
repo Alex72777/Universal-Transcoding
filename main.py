@@ -8,6 +8,7 @@ No pip packages needed — pure stdlib + tkinter.
 """
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import platform
@@ -29,7 +30,7 @@ from tkinter.scrolledtext import ScrolledText
 # ──────────────────────────────────────────────────────────────────── meta ───
 
 APP_NAME = "UL Transcoding"
-VERSION  = "1.0.0"
+VERSION  = "1.0.1"
 
 # ─────────────────────────────────────────────────────── file-type detection ──
 
@@ -112,6 +113,46 @@ QUALITY_PRESETS: dict[str, dict] = {
 DEFAULT_FORMAT  = "MP4 — H.264 + AAC  (recommended)"
 DEFAULT_QUALITY = "Medium     (CRF 23)"
 DEFAULT_THREADS = min(os.cpu_count() or 4, 16)
+
+# ────────────────────────────────────────────────────────────────── CLI aliases ──
+
+# Short, shell-friendly aliases for OUTPUT_FORMATS / QUALITY_PRESETS.
+# Each value must be an exact key in the respective dict above.
+CLI_FORMAT_MAP: dict[str, str] = {
+    "mp4":       DEFAULT_FORMAT,
+    "mp4-aac":   DEFAULT_FORMAT,
+    "mp4-opus":  "MP4 — H.264 + Opus",
+    "webm":      "WebM — VP9 + Opus",
+    "webm-vp9":  "WebM — VP9 + Opus",
+    "webm-vp8":  "WebM — VP8 + Vorbis",
+    "mkv":       "MKV — H.264 + AAC",
+}
+
+CLI_QUALITY_MAP: dict[str, str] = {
+    "veryhigh": "Very High  (CRF 16)",
+    "high":     "High       (CRF 20)",
+    "medium":   DEFAULT_QUALITY,
+    "low":      "Low        (CRF 28)",
+    "verylow":  "Very Low   (CRF 32)",
+}
+
+_CLI_EPILOG = """\
+Format aliases  (-f / --format):
+  mp4        MP4 — H.264 + AAC   [default]
+  mp4-aac    MP4 — H.264 + AAC
+  mp4-opus   MP4 — H.264 + Opus
+  webm       WebM — VP9 + Opus
+  webm-vp9   WebM — VP9 + Opus
+  webm-vp8   WebM — VP8 + Vorbis
+  mkv        MKV — H.264 + AAC
+
+Quality presets  (-q / --quality):
+  veryhigh   CRF 16, slow preset
+  high       CRF 20, medium preset
+  medium     CRF 23, medium preset   [default]
+  low        CRF 28, fast preset
+  verylow    CRF 32, veryfast preset
+"""
 
 # ──────────────────────────────────────────────────────────────── data types ──
 
@@ -446,7 +487,7 @@ class Worker(threading.Thread):
             self.send(Msg("job_done", job, f"FAIL  {job.src.name}  (exit code {rc})"))
 
 
-# ──────────────────────────────────────────────────────────────── UI helpers ──
+# ──────────────────────────────────────────────────────── shared helpers ───
 
 def _ts() -> str:
     return datetime.now().strftime("%H:%M:%S")
@@ -464,6 +505,106 @@ def _open_folder(path: str) -> None:
             subprocess.Popen(["xdg-open", path])
     except Exception:
         pass
+
+
+# ──────────────────────────────────────────────────────────── CLI handler ───
+
+class CLIHandler:
+    """Translates Worker Msg objects into coloured terminal output."""
+
+    _ANSI: dict[str, str] = {
+        "info":  "\033[93m",   # yellow
+        "start": "\033[94m",   # blue
+        "skip":  "\033[90m",   # grey
+        "done":  "\033[92m",   # green
+        "fail":  "\033[91m",   # red
+        "warn":  "\033[33m",   # orange
+        "reset": "\033[0m",
+    }
+
+    def __init__(self, total: int, use_color: bool) -> None:
+        self.total     = total
+        self.n_done    = 0
+        self.n_skip    = 0
+        self.n_fail    = 0
+        self._color    = use_color
+        self._in_prog  = False      # True while a progress line is displayed
+        self._lock     = threading.Lock()
+
+    # ── public ────────────────────────────────────────────────────────────
+
+    def handle(self, msg: Msg) -> None:
+        """Thread-safe message handler — may be called from the worker thread."""
+        with self._lock:
+            self._handle(msg)
+
+    # ── internal ──────────────────────────────────────────────────────────
+
+    def _c(self, tag: str, text: str) -> str:
+        """Wrap *text* in ANSI colour for *tag*, or return it unchanged."""
+        if not self._color or tag not in self._ANSI:
+            return text
+        return f"{self._ANSI[tag]}{text}{self._ANSI['reset']}"
+
+    def _erase_progress(self) -> None:
+        """Overwrite the in-place progress line with spaces, then reset cursor."""
+        if self._in_prog:
+            print("\r" + " " * 55 + "\r", end="", flush=True)
+            self._in_prog = False
+
+    def _handle(self, msg: Msg) -> None:    # noqa: C901
+        job = msg.job
+
+        if msg.kind == "log":
+            self._erase_progress()
+            print(self._c(msg.tag or "", f"[{_ts()}] {msg.text}"))
+
+        elif msg.kind == "job_start":
+            self._erase_progress()
+            print(self._c("start", f"[{_ts()}] {msg.text}"))
+
+        elif msg.kind == "job_progress":
+            assert job is not None
+            pct    = job.progress
+            w      = 32
+            filled = int(w * pct / 100)
+            bar    = "\u2588" * filled + "\u2591" * (w - filled)
+            print(f"\r  [{bar}] {pct:5.1f}%", end="", flush=True)
+            self._in_prog = True
+
+        elif msg.kind == "job_done":
+            assert job is not None
+            self._erase_progress()
+
+            # Mirror App._handle counter logic exactly
+            if msg.tag and job.status == Status.DONE:
+                tag = msg.tag       # COPY — compatible file
+                self.n_done += 1
+            elif msg.tag:
+                tag = msg.tag       # WARN — no video stream
+                self.n_skip += 1
+            elif job.status == Status.SKIPPED:
+                tag = "skip"
+                self.n_skip += 1
+            elif job.status == Status.DONE:
+                tag = "done"
+                self.n_done += 1
+            else:
+                tag = "fail"
+                self.n_fail += 1
+
+            completed = self.n_done + self.n_skip + self.n_fail
+            print(self._c(tag, f"[{_ts()}] {msg.text}  [{completed}/{self.total}]"))
+
+        elif msg.kind == "all_done":
+            self._erase_progress()
+            print(self._c(
+                "info",
+                f"\n\u2500\u2500 All done \u2500\u2500  "
+                f"Converted: {self.n_done}   "
+                f"Skipped: {self.n_skip}   "
+                f"Failed: {self.n_fail}",
+            ))
 
 
 # ──────────────────────────────────────────────────────────────────── App ────
@@ -945,9 +1086,179 @@ class App(tk.Tk):
             self.destroy()
 
 
-# ─────────────────────────────────────────────────────────────────── entry ───
+# ───────────────────────────────────────────────────────────────── CLI entry ───
+
+def _parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        prog=os.path.basename(sys.argv[0]),
+        description=(
+            f"{APP_NAME} v{VERSION}\n"
+            "Convert video files to browser-compatible formats."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=_CLI_EPILOG,
+    )
+    p.add_argument("-i", "--input",   default=None, metavar="DIR",
+                   help="Input folder to scan for video files")
+    p.add_argument("-o", "--output",  default=None, metavar="DIR",
+                   help="Output folder for converted files")
+    p.add_argument("-f", "--format",  default="mp4",    metavar="FORMAT",
+                   help="Output format alias (default: mp4)")
+    p.add_argument("-q", "--quality", default="medium", metavar="QUALITY",
+                   help="Quality preset alias (default: medium)")
+    p.add_argument("-t", "--threads", default=DEFAULT_THREADS, type=int,
+                   metavar="N",
+                   help=f"Encoder thread count (default: {DEFAULT_THREADS})")
+    p.add_argument("--no-recursive",  action="store_true",
+                   help="Do not scan sub-folders (default: recursive)")
+    p.add_argument("--delete",        action="store_true",
+                   help="Delete original files after successful conversion or copy")
+    p.add_argument("--list-formats",  action="store_true",
+                   help="Print available format and quality options, then exit")
+    return p.parse_args()
+
+
+def run_cli(args: argparse.Namespace) -> int:
+    """CLI entry point. Returns a POSIX exit code (0 = success, 1 = any failure)."""
+
+    # ── --list-formats ─────────────────────────────────────────────────────
+    if args.list_formats:
+        print(_CLI_EPILOG)
+        return 0
+
+    # ── require -i / -o when not just listing formats ───────────────────
+    if not args.input or not args.output:
+        print(
+            "Error: -i/--input and -o/--output are required."
+            "  Run with --help for usage.",
+            file=sys.stderr,
+        )
+        return 1
+
+    # ── locate ffmpeg ────────────────────────────────────────────────────
+    try:
+        ffmpeg, ffprobe = find_ffmpeg()
+    except RuntimeError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"{APP_NAME} v{VERSION}  |  {ffmpeg_version(ffmpeg)}\n")
+
+    # ── validate dirs ───────────────────────────────────────────────────
+    in_dir  = Path(args.input)
+    out_dir = Path(args.output)
+
+    if not in_dir.is_dir():
+        print(f"Error: Input folder not found: {in_dir}", file=sys.stderr)
+        return 1
+    if in_dir == out_dir:
+        print("Error: Input and output folders must be different.", file=sys.stderr)
+        return 1
+    try:
+        out_dir.relative_to(in_dir)         # raises ValueError when OK
+        print("Error: Output folder must not be inside the input folder.",
+              file=sys.stderr)
+        return 1
+    except ValueError:
+        pass
+
+    # ── resolve format / quality ────────────────────────────────────────
+    fmt_key = CLI_FORMAT_MAP.get(args.format.lower())
+    if fmt_key is None:
+        print(
+            f"Error: Unknown format '{args.format}'.  "
+            "Run with --list-formats to see options.",
+            file=sys.stderr,
+        )
+        return 1
+    fmt = OUTPUT_FORMATS[fmt_key]
+
+    qual_key = CLI_QUALITY_MAP.get(args.quality.lower())
+    if qual_key is None:
+        print(
+            f"Error: Unknown quality preset '{args.quality}'.  "
+            "Run with --list-formats to see options.",
+            file=sys.stderr,
+        )
+        return 1
+    quality = QUALITY_PRESETS[qual_key]
+    threads = max(1, args.threads)
+
+    # ── scan files ────────────────────────────────────────────────────────
+    pattern = "**/*" if not args.no_recursive else "*"
+    files   = sorted(
+        p for p in in_dir.glob(pattern)
+        if p.is_file() and p.suffix.lower() in VIDEO_EXTENSIONS
+    )
+
+    if not files:
+        print("No video files found in the input folder.")
+        return 0
+
+    jobs: List[Job] = []
+    for src in files:
+        rel = src.relative_to(in_dir)
+        dst = out_dir / rel.with_suffix(f".{fmt['ext']}")
+        jobs.append(Job(src=src, dst=dst))
+
+    total_mb = sum(j.src.stat().st_size for j in jobs) / (1024 * 1024)
+
+    # ── print summary ────────────────────────────────────────────────────
+    print(f"Input:    {in_dir}")
+    print(f"Output:   {out_dir}")
+    print(f"Format:   {args.format}  \u2192  {fmt_key}")
+    print(f"Quality:  {args.quality}  \u2192  {qual_key}")
+    print(f"Threads:  {threads}")
+    if args.delete:
+        print("\u26a0  Delete originals: ON")
+    print(f"\nFound {len(jobs)} file(s)  ({total_mb:.1f} MB total):")
+    for j in jobs:
+        size_mb = j.src.stat().st_size / (1024 * 1024)
+        print(f"  {j.src.relative_to(in_dir)}  ({size_mb:.1f} MB)")
+    print()
+
+    # ── run worker ────────────────────────────────────────────────────────
+    handler = CLIHandler(total=len(jobs), use_color=sys.stdout.isatty())
+    done_ev = threading.Event()
+
+    def _send(msg: Msg) -> None:
+        handler.handle(msg)
+        if msg.kind == "all_done":
+            done_ev.set()
+
+    worker = Worker(
+        jobs             = jobs,
+        ffmpeg           = ffmpeg,
+        ffprobe          = ffprobe,
+        fmt              = fmt,
+        quality          = quality,
+        threads          = threads,
+        send             = _send,
+        delete_originals = args.delete,
+    )
+
+    try:
+        worker.start()
+        # Wake up every 0.25 s so KeyboardInterrupt is handled promptly
+        while not done_ev.wait(timeout=0.25):
+            pass
+    except KeyboardInterrupt:
+        print("\nInterrupted — stopping…")
+        worker.stop()
+        worker.join(timeout=15)
+        return 130   # conventional SIGINT exit code
+
+    return 1 if handler.n_fail > 0 else 0
+
+
+# ────────────────────────────────────────────────────────────────────── entry ───
 
 def main() -> None:
+    if len(sys.argv) > 1:
+        # Any argument triggers CLI mode — tkinter is not touched.
+        sys.exit(run_cli(_parse_args()))
+
+    # No arguments → launch the GUI.
     app = App()
     app.mainloop()
 
