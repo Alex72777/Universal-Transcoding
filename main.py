@@ -304,7 +304,7 @@ def _detect_hw_accel(ffmpeg: str) -> str:
 def probe(ffprobe_path: str, src: Path) -> tuple[str, str, str, float]:
     """Return (vcodec, acodec, container, duration_sec). Raises ValueError on error."""
     cmd = [
-        ffprobe_path, "-v", "quiet",
+        ffprobe_path, "-v", "error",   # quiet suppresses errors too; error keeps them
         "-print_format", "json",
         "-show_format", "-show_streams",
         str(src),
