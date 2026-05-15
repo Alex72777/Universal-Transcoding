@@ -301,16 +301,29 @@ def _detect_hw_accel(ffmpeg: str) -> str:
     return ""
 
 
-def probe(ffprobe_path: str, src: Path) -> tuple[str, str, str, float]:
-    """Return (vcodec, acodec, container, duration_sec). Raises ValueError on error."""
+def probe(
+    ffprobe_path: str,
+    src: Path,
+    lenient: bool = False,
+) -> tuple[str, str, str, float]:
+    """Return (vcodec, acodec, container, duration_sec). Raises ValueError on error.
+
+    When *lenient* is True, larger analyzeduration / probesize values are used
+    to handle files whose format info is buried deep in the stream.
+    """
     cmd = [
-        ffprobe_path, "-v", "error",   # quiet suppresses errors too; error keeps them
+        ffprobe_path, "-v", "error",
         "-print_format", "json",
         "-show_format", "-show_streams",
-        str(src),
     ]
+    if lenient:
+        # Give ffprobe much more room to find container/codec info in
+        # damaged, partially-downloaded, or non-standard files.
+        cmd += ["-analyzeduration", "100M", "-probesize", "100M"]
+    cmd.append(str(src))
+
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
     except subprocess.TimeoutExpired:
         raise ValueError("ffprobe timed out")
     if r.returncode != 0:
@@ -342,14 +355,20 @@ def is_compatible(job: Job, fmt: dict) -> bool:
 
 
 def build_cmd(
-    ffmpeg_path: str,
-    job:         Job,
-    fmt:         dict,
-    quality:     dict,
-    threads:     int,
-    hw_accel:    str = "",
+    ffmpeg_path:    str,
+    job:            Job,
+    fmt:            dict,
+    quality:        dict,
+    threads:        int,
+    hw_accel:       str  = "",
+    force_transcode: bool = False,
 ) -> list[str]:
-    """Assemble the ffmpeg command for one transcoding job."""
+    """Assemble the ffmpeg command for one transcoding job.
+
+    When *force_transcode* is True the file is treated as fully unknown
+    (probe failed): compat-copy is skipped and error-tolerant input flags
+    are added so ffmpeg can limp through damaged or non-standard streams.
+    """
     crf    = quality["crf"]
     preset = quality["preset"]
     sw_vcodec = fmt["vcodec"]
@@ -359,11 +378,17 @@ def build_cmd(
     if hw_accel and hw_accel in HW_ACCEL_BACKENDS:
         hw_enc = HW_ACCEL_BACKENDS[hw_accel].get(sw_vcodec)
 
+    # ── error-tolerant input flags for files that failed probing ───────────
+    tolerant: list[str] = (
+        ["-fflags", "+genpts+igndts+discardcorrupt", "-err_detect", "ignore_err"]
+        if force_transcode else []
+    )
+
     # ── video args ─────────────────────────────────────────────────────────
     extra_input: list[str] = []
     vf_args:     list[str] = []
 
-    if job.vcodec in fmt["compat_vcodec"]:
+    if not force_transcode and job.vcodec in fmt["compat_vcodec"]:
         v_args: list[str] = ["-c:v", "copy"]
 
     elif hw_enc:
@@ -394,7 +419,7 @@ def build_cmd(
         v_args = ["-c:v", sw_vcodec, "-crf", crf, "-preset", preset]
 
     # ── audio args ─────────────────────────────────────────────────────────
-    if job.acodec in fmt["compat_acodec"]:
+    if not force_transcode and job.acodec in fmt["compat_acodec"]:
         a_args: list[str] = ["-c:a", "copy"]
     else:
         ac     = fmt["acodec"]
@@ -407,6 +432,7 @@ def build_cmd(
     return [
         ffmpeg_path, "-y",
         *extra_input,
+        *tolerant,
         "-i", str(job.src),
         "-map", "0:v:0?",
         "-map", "0:a?",
@@ -492,32 +518,57 @@ class Worker(threading.Thread):
     # ── per-job processing ─────────────────────────────────────────────────
 
     def _process(self, job: Job) -> None:  # noqa: C901
-        fmt = self.fmt
+        fmt             = self.fmt
+        force_transcode = False   # set True when probe fails; skips compat logic
 
-        # 1. Probe ──────────────────────────────────────────────────────────
+        # 1. Probe ─────────────────────────────────────────────────────────
         try:
             job.vcodec, job.acodec, job.container, job.duration = probe(
                 self.ffprobe, job.src
             )
-        except Exception as exc:
-            job.status = Status.FAILED
-            job.error  = str(exc)
-            self.send(Msg("job_done", job, f"FAIL  {job.src.name} — probe error: {exc}"))
-            return
+        except Exception as first_exc:
+            # Re-try with a more lenient probe (bigger buffers / longer analysis)
+            try:
+                job.vcodec, job.acodec, job.container, job.duration = probe(
+                    self.ffprobe, job.src, lenient=True
+                )
+                self.send(Msg("log",
+                              text=(
+                                  f"WARN  {job.src.name} — standard probe failed "
+                                  f"({first_exc}); lenient probe succeeded, "
+                                  f"continuing"
+                              ),
+                              tag="warn"))
+            except Exception as second_exc:
+                # Both probes failed — attempt a blind transcode instead of
+                # giving up.  ffmpeg is far more resilient than ffprobe and
+                # can often decode files that ffprobe cannot parse.
+                force_transcode = True
+                self.send(Msg("log",
+                              text=(
+                                  f"WARN  {job.src.name} — probe failed "
+                                  f"({second_exc}); attempting blind transcode "
+                                  f"with error-tolerant flags"
+                              ),
+                              tag="warn"))
 
-        if not job.vcodec:
+        # Only skip for 'no video stream' when probe actually succeeded
+        if not force_transcode and not job.vcodec:
             job.status = Status.SKIPPED
             self.send(Msg("job_done", job,
                           f"WARN  {job.src.name} — no video stream, skipping",
                           tag="warn"))
             return
 
-        compatible = is_compatible(job, fmt)
+        compatible = (not force_transcode) and is_compatible(job, fmt)
 
         # 2. Dry-run — report intent, touch nothing ─────────────────────────
         if self.dry_run:
             src_sz = _fmt_size(job.src.stat().st_size)
-            if compatible:
+            if force_transcode:
+                action = (f"DRY   {job.src.name}  [{src_sz}]"
+                          f"  → would TRANSCODE (blind — probe failed)")
+            elif compatible:
                 if self.in_place and job.dst == job.src:
                     action = (f"DRY   {job.src.name}  [{src_sz}]"
                               f"  → already in place & compatible, would skip")
@@ -534,7 +585,7 @@ class Worker(threading.Thread):
             self.send(Msg("job_done", job, action, tag="dry"))
             return
 
-        # 3. Compatible file — copy (or skip if already in place) ────────────
+        # 3. Compatible file — copy (or skip if already in place) ──────────
         if compatible:
             if self.in_place and job.dst == job.src:
                 job.status   = Status.DONE
@@ -578,14 +629,16 @@ class Worker(threading.Thread):
 
         # 6. Build command and start ────────────────────────────────────────
         cmd = build_cmd(self.ffmpeg, job, fmt, self.quality,
-                        self.threads, self.hw_accel)
+                        self.threads, self.hw_accel, force_transcode)
         job.status = Status.RUNNING
 
-        hw_label = f" [{self.hw_accel.upper()}]" if self.hw_accel else ""
+        hw_label    = f" [{self.hw_accel.upper()}]" if self.hw_accel else ""
+        blind_label = " [blind]" if force_transcode else ""
+        codec_info  = ("unknown/unknown" if force_transcode
+                       else f"{job.vcodec}/{job.acodec}")
         self.send(Msg("job_start", job,
-                      f"START {job.src.name}  →  {real_dst.name}{hw_label}"
-                      f"  [{job.vcodec}/{job.acodec}"
-                      f" → {fmt['vcodec']}/{fmt['acodec']}]"))
+                      f"START {job.src.name}  →  {real_dst.name}{hw_label}{blind_label}"
+                      f"  [{codec_info} → {fmt['vcodec']}/{fmt['acodec']}]"))
 
         # 7. Run ffmpeg, stream progress ─────────────────────────────────────
         # stderr is captured in a background thread so the pipe never blocks
