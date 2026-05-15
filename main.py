@@ -849,9 +849,10 @@ class App(_AppBase):  # type: ignore[misc]
             self.destroy()
             return
 
-        self._jobs:   List[Job]              = []
-        self._worker: Optional[Worker]       = None
-        self._queue:  queue.SimpleQueue[Msg] = queue.SimpleQueue()
+        self._jobs:           List[Job]              = []
+        self._file_selection: List[Path]             = []  # explicitly picked files
+        self._worker:         Optional[Worker]       = None
+        self._queue:          queue.SimpleQueue[Msg] = queue.SimpleQueue()
         self._n_done = self._n_skip = self._n_fail = 0
         self._in_bytes = self._out_bytes = 0
 
@@ -893,12 +894,17 @@ class App(_AppBase):  # type: ignore[misc]
         self._in_var  = tk.StringVar()
         self._out_var = tk.StringVar()
 
-        ttk.Label(pf, text="Input folder:").grid(
+        ttk.Label(pf, text="Input:").grid(
             row=0, column=0, sticky="w", padx=8, pady=3)
-        ttk.Entry(pf, textvariable=self._in_var).grid(
-            row=0, column=1, sticky="ew", padx=4, pady=3)
-        ttk.Button(pf, text="Browse…", width=9, command=self._browse_in).grid(
-            row=0, column=2, padx=8, pady=3)
+        self._inp_entry = ttk.Entry(pf, textvariable=self._in_var)
+        self._inp_entry.grid(row=0, column=1, sticky="ew", padx=4, pady=3)
+        # Two browse buttons in a sub-frame so the column width stays fixed
+        _ibf = ttk.Frame(pf)
+        _ibf.grid(row=0, column=2, padx=8, pady=3)
+        ttk.Button(_ibf, text="Folder…",  width=8,
+                   command=self._browse_in_folder).pack(side="left", padx=(0, 2))
+        ttk.Button(_ibf, text="File(s)…", width=8,
+                   command=self._browse_in_files).pack(side="left")
 
         ttk.Label(pf, text="Output folder:").grid(
             row=1, column=0, sticky="w", padx=8, pady=3)
@@ -1058,14 +1064,58 @@ class App(_AppBase):  # type: ignore[misc]
         else:
             self._chk_del.config(state="normal")
 
-    def _browse_in(self) -> None:
+    def _browse_in_folder(self) -> None:
         d = filedialog.askdirectory(title="Select input folder")
         if not d:
             return
+        # Clear any previous file selection and restore the entry to normal
+        self._file_selection = []
+        self._inp_entry.config(state="normal")
         self._in_var.set(d)
         if not self._out_var.get().strip() and not self._inp_var.get():
             p = Path(d)
             self._out_var.set(str(p.parent / f"{p.name}_transcoded"))
+
+    def _browse_in_files(self) -> None:
+        raw = filedialog.askopenfilenames(
+            title="Select video file(s)",
+            filetypes=[
+                ("Video files",
+                 " ".join(f"*{e}" for e in sorted(VIDEO_EXTENSIONS))),
+                ("All files", "*.*"),
+            ],
+        )
+        if not raw:
+            return
+        paths = [Path(f) for f in raw
+                 if Path(f).suffix.lower() in VIDEO_EXTENSIONS]
+        if not paths:
+            messagebox.showwarning(
+                "No video files",
+                "None of the selected files are recognised video formats."
+            )
+            return
+
+        self._file_selection = paths
+        # Make the entry read-only — content is a display summary only
+        self._inp_entry.config(state="readonly")
+
+        if len(paths) == 1:
+            self._in_var.set(str(paths[0]))
+        else:
+            try:
+                common = Path(os.path.commonpath([str(p.parent) for p in paths]))
+            except ValueError:
+                common = paths[0].parent
+            self._in_var.set(f"{len(paths)} files  —  {common}")
+
+        # Auto-suggest output folder if not already set
+        if not self._out_var.get().strip() and not self._inp_var.get():
+            try:
+                base = Path(os.path.commonpath([str(p.parent) for p in paths]))
+            except ValueError:
+                base = paths[0].parent
+            self._out_var.set(str(base.parent / f"{base.name}_transcoded"))
 
     def _browse_out(self) -> None:
         d = filedialog.askdirectory(title="Select output folder")
@@ -1073,61 +1123,104 @@ class App(_AppBase):  # type: ignore[misc]
             self._out_var.set(d)
 
     def _open_output(self) -> None:
-        target = self._in_var.get().strip() if self._inp_var.get() \
-                 else self._out_var.get().strip()
-        if target:
-            _open_folder(target)
+        if self._inp_var.get():   # in-place: open the source location
+            if self._file_selection:
+                _open_folder(str(self._file_selection[0].parent))
+            else:
+                _open_folder(self._in_var.get().strip())
+        else:
+            _open_folder(self._out_var.get().strip())
 
     # ── Scan ──────────────────────────────────────────────────────────────────
 
-    def _scan(self) -> None:
-        in_dir  = Path(self._in_var.get().strip())
+    def _scan(self) -> None:   # noqa: C901
         in_place = self._inp_var.get()
+        fmt      = OUTPUT_FORMATS[self._fmt_var.get()]
+        ext      = fmt["ext"]
 
-        if not in_dir.is_dir():
-            messagebox.showerror("Error", "Input folder does not exist.")
-            return
+        if self._file_selection:
+            # ── File-selection mode ───────────────────────────────────────
+            sources = [f for f in self._file_selection if f.is_file()]
+            if not sources:
+                messagebox.showerror("Error",
+                                     "None of the selected files could be found.")
+                return
 
-        if in_place:
-            out_dir = in_dir
+            if in_place:
+                out_dir: Optional[Path] = None
+            else:
+                out_str = self._out_var.get().strip()
+                if not out_str:
+                    messagebox.showerror("Error",
+                                         "Please specify an output folder.")
+                    return
+                out_dir = Path(out_str)
+
+            self._jobs = []
+            for src in sorted(sources):
+                dst = (src.parent if in_place
+                       else out_dir) / src.with_suffix(f".{ext}").name  # type: ignore[operator]
+                self._jobs.append(Job(src=src, dst=dst))
+
+            log_header = (f"[{_ts()}] {len(sources)} file(s) selected\n"
+                          if len(sources) > 1 else
+                          f"[{_ts()}] File: {sources[0]}\n")
+            log_show = lambda j: str(j.src)   # show full path for explicit files
+
         else:
-            out_str = self._out_var.get().strip()
-            if not out_str:
-                messagebox.showerror("Error", "Please specify an output folder.")
+            # ── Folder mode ───────────────────────────────────────────────
+            in_dir = Path(self._in_var.get().strip())
+            if not in_dir.is_dir():
+                messagebox.showerror("Error", "Input folder does not exist.")
                 return
-            out_dir = Path(out_str)
-            if in_dir == out_dir:
-                messagebox.showerror("Error",
-                                     "Input and output folders must be different.")
+
+            if in_place:
+                out_dir = None
+                _out_for_check = in_dir
+            else:
+                out_str = self._out_var.get().strip()
+                if not out_str:
+                    messagebox.showerror("Error",
+                                         "Please specify an output folder.")
+                    return
+                out_dir = Path(out_str)
+                _out_for_check = out_dir
+                if in_dir == out_dir:
+                    messagebox.showerror(
+                        "Error", "Input and output folders must be different.")
+                    return
+                try:
+                    out_dir.relative_to(in_dir)
+                    messagebox.showerror(
+                        "Error",
+                        "Output folder must not be inside the input folder.")
+                    return
+                except ValueError:
+                    pass
+
+            pattern = "**/*" if self._rec_var.get() else "*"
+            files   = sorted(
+                p for p in in_dir.glob(pattern)
+                if p.is_file() and p.suffix.lower() in VIDEO_EXTENSIONS
+            )
+            if not files:
+                messagebox.showinfo(
+                    "No files found",
+                    "No video files were found in the selected folder.")
                 return
-            try:
-                out_dir.relative_to(in_dir)
-                messagebox.showerror("Error",
-                                     "Output folder must not be inside the input folder.")
-                return
-            except ValueError:
-                pass
 
-        fmt     = OUTPUT_FORMATS[self._fmt_var.get()]
-        ext     = fmt["ext"]
-        recurse = self._rec_var.get()
+            self._jobs = []
+            for src in files:
+                rel = src.relative_to(in_dir)
+                dst = (in_dir if in_place
+                       else out_dir) / rel.with_suffix(f".{ext}")  # type: ignore[operator]
+                self._jobs.append(Job(src=src, dst=dst))
 
-        pattern = "**/*" if recurse else "*"
-        files   = sorted(
-            p for p in in_dir.glob(pattern)
-            if p.is_file() and p.suffix.lower() in VIDEO_EXTENSIONS
-        )
-        if not files:
-            messagebox.showinfo("No files found",
-                                "No video files were found in the selected folder.")
-            return
+            log_header = f"[{_ts()}] Scanned:  {in_dir}\n"
+            log_show = lambda j: str(j.src.relative_to(in_dir))
+            out_dir = out_dir  # may be None for in-place
 
-        self._jobs = []
-        for src in files:
-            rel = src.relative_to(in_dir)
-            dst = out_dir / rel.with_suffix(f".{ext}")
-            self._jobs.append(Job(src=src, dst=dst))
-
+        # ── Shared post-scan UI update ─────────────────────────────────────
         self._n_done = self._n_skip = self._n_fail = 0
         self._in_bytes = self._out_bytes = 0
         self._bar_overall["value"]   = 0
@@ -1140,8 +1233,8 @@ class App(_AppBase):  # type: ignore[misc]
         total_bytes = sum(j.src.stat().st_size for j in self._jobs)
 
         self._log_clear()
-        self._log_write(f"[{_ts()}] Scanned:  {in_dir}\n", "info")
-        if not in_place:
+        self._log_write(log_header, "info")
+        if not in_place and out_dir:
             self._log_write(f"[{_ts()}] Output:   {out_dir}\n", "info")
         self._log_write(
             f"[{_ts()}] Found {len(self._jobs)} file(s)  "
@@ -1149,8 +1242,9 @@ class App(_AppBase):  # type: ignore[misc]
             "info",
         )
         for j in self._jobs:
-            sz = _fmt_size(j.src.stat().st_size)
-            self._log_write(f"  {j.src.relative_to(in_dir)}  ({sz})\n")
+            self._log_write(
+                f"  {log_show(j)}  ({_fmt_size(j.src.stat().st_size)})\n"
+            )
 
         mode = " [DRY RUN]" if self._dry_var.get() else ""
         self._stat_var.set(
