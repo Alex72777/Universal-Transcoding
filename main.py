@@ -20,7 +20,7 @@ import threading
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, List, Optional
+from typing import Any, Callable, List, Optional
 
 try:
     import tkinter as tk
@@ -197,7 +197,8 @@ Quality presets  (-q / --quality):
   verylow    CRF 32, veryfast preset
 
 Hardware acceleration  (--hw-accel):
-  none           Software encoding   [default]
+  auto           Auto-detect best available backend   [default]
+  none           Software encoding (disable HW accel)
   nvenc          NVIDIA NVENC
   vaapi          VAAPI — Intel / AMD (Linux)
   videotoolbox   Apple VideoToolbox (macOS)
@@ -265,6 +266,38 @@ def _find_vaapi_device() -> str:
         p = f"/dev/dri/renderD{128 + i}"
         if os.path.exists(p):
             return p
+    return ""
+
+
+# Preference order for auto-detection (first match wins).
+# Each tuple is (backend_key, encoder_name_to_look_for_in_ffmpeg_output).
+_HW_DETECT_ORDER = [
+    ("nvenc",        "h264_nvenc"),
+    ("vaapi",        "h264_vaapi"),
+    ("videotoolbox", "h264_videotoolbox"),
+    ("qsv",          "h264_qsv"),
+    ("amf",          "h264_amf"),
+]
+
+
+def _detect_hw_accel(ffmpeg: str) -> str:
+    """Return the best available HW-accel backend key, or "" for software.
+
+    Queries `ffmpeg -encoders` and returns the first backend whose H.264
+    encoder appears in the output.  Being listed there means the encoder was
+    compiled in; in practice this is a reliable proxy for hardware being present.
+    """
+    try:
+        r = subprocess.run(
+            [ffmpeg, "-hide_banner", "-encoders"],
+            capture_output=True, text=True, timeout=10,
+        )
+        listed = r.stdout
+    except Exception:
+        return ""
+    for backend, encoder in _HW_DETECT_ORDER:
+        if encoder in listed:
+            return backend
     return ""
 
 
@@ -555,14 +588,27 @@ class Worker(threading.Thread):
                       f" → {fmt['vcodec']}/{fmt['acodec']}]"))
 
         # 7. Run ffmpeg, stream progress ─────────────────────────────────────
+        # stderr is captured in a background thread so the pipe never blocks
+        # while we read stdout for progress updates.
+        stderr_lines: list[str] = []
+
+        def _drain_stderr(pipe: Any) -> None:
+            for ln in pipe:
+                stderr_lines.append(ln.rstrip())
+
         try:
             self._proc = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,   # captured, not discarded
                 text=True,
                 bufsize=1,
             )
+            _et = threading.Thread(
+                target=_drain_stderr, args=(self._proc.stderr,), daemon=True
+            )
+            _et.start()
+
             dur_us = job.duration * 1_000_000
 
             for line in self._proc.stdout:       # type: ignore[union-attr]
@@ -579,6 +625,7 @@ class Worker(threading.Thread):
                         pass
 
             self._proc.wait()
+            _et.join(timeout=3)
             rc = self._proc.returncode
         except Exception as exc:
             job.status = Status.FAILED
@@ -628,6 +675,11 @@ class Worker(threading.Thread):
             job.dst    = real_dst
             job.status = Status.FAILED
             job.error  = f"ffmpeg exit code {rc}"
+            # Emit the last few non-empty stderr lines so the user can see
+            # exactly why ffmpeg failed (e.g. "No NVENC capable devices found").
+            relevant = [l for l in stderr_lines if l.strip()][-6:]
+            for l in relevant:
+                self.send(Msg("log", text=f"       {l}", tag="fail"))
             self.send(Msg("job_done", job, f"FAIL  {job.src.name}  (exit code {rc})"))
 
 
@@ -810,7 +862,22 @@ class App(_AppBase):  # type: ignore[misc]
         self._log_write(f"[{_ts()}] {APP_NAME} v{VERSION} ready\n", "info")
         self._log_write(f"[{_ts()}] {ver}\n", "info")
         self._log_write(f"[{_ts()}] ffmpeg:  {self._ffmpeg}\n", "info")
-        self._log_write(f"[{_ts()}] ffprobe: {self._ffprobe}\n\n", "info")
+        self._log_write(f"[{_ts()}] ffprobe: {self._ffprobe}\n", "info")
+
+        # Auto-detect hardware acceleration and pre-select in the dropdown.
+        detected = _detect_hw_accel(self._ffmpeg)
+        if detected:
+            self._hw_var.set(HW_ACCEL_LABELS[detected])
+            self._log_write(
+                f"[{_ts()}] HW accel auto-detected: {HW_ACCEL_LABELS[detected]}\n",
+                "info",
+            )
+        else:
+            self._log_write(
+                f"[{_ts()}] No hardware acceleration detected — using software encoding\n",
+                "info",
+            )
+        self._log_write("\n", "info")
 
         self.after(80, self._poll)
 
@@ -893,9 +960,9 @@ class App(_AppBase):  # type: ignore[misc]
             row=3, column=2, columnspan=2, sticky="w", padx=8, pady=(2, 0))
 
         # Row 4: two checkboxes side by side
-        ttk.Checkbutton(sf, text="Delete originals after conversion",
-                        variable=self._del_var).grid(
-            row=4, column=0, columnspan=2, sticky="w", padx=8, pady=(0, 4))
+        self._chk_del = ttk.Checkbutton(sf, text="Delete originals after conversion",
+                                        variable=self._del_var)
+        self._chk_del.grid(row=4, column=0, columnspan=2, sticky="w", padx=8, pady=(0, 4))
         ttk.Checkbutton(sf, text="Dry run (no files written)",
                         variable=self._dry_var).grid(
             row=4, column=2, columnspan=2, sticky="w", padx=8, pady=(0, 4))
@@ -978,10 +1045,18 @@ class App(_AppBase):  # type: ignore[misc]
     # ── Callbacks ─────────────────────────────────────────────────────────────
 
     def _on_inplace_toggle(self) -> None:
-        """Disable/re-enable the output folder field when in-place is toggled."""
-        state = "disabled" if self._inp_var.get() else "normal"
-        self._out_entry.config(state=state)
-        self._btn_browse_out.config(state=state)
+        """Grey out output folder and 'delete originals' when in-place is active."""
+        in_place = self._inp_var.get()
+        folder_state = "disabled" if in_place else "normal"
+        self._out_entry.config(state=folder_state)
+        self._btn_browse_out.config(state=folder_state)
+        # "Delete originals" is redundant in-place (the original is already
+        # overwritten), so disable it and uncheck it to avoid confusion.
+        if in_place:
+            self._del_var.set(False)
+            self._chk_del.config(state="disabled")
+        else:
+            self._chk_del.config(state="normal")
 
     def _browse_in(self) -> None:
         d = filedialog.askdirectory(title="Select input folder")
@@ -1358,8 +1433,8 @@ def _parse_args() -> argparse.Namespace:
                    help="Convert files in their source directory (no --output needed)")
     p.add_argument("--dry-run",       action="store_true",
                    help="Probe files and report what would happen; write nothing")
-    p.add_argument("--hw-accel",      default="none", metavar="BACKEND",
-                   help="Hardware acceleration backend (default: none)")
+    p.add_argument("--hw-accel",      default="auto", metavar="BACKEND",
+                   help="Hardware acceleration backend (default: auto)")
     p.add_argument("--list-formats",  action="store_true",
                    help="Print available format/quality/hw options and exit")
     return p.parse_args()
@@ -1430,10 +1505,18 @@ def run_cli(args: argparse.Namespace) -> int:
     quality = QUALITY_PRESETS[qual_key]
     threads = max(1, args.threads)
 
-    hw_accel = args.hw_accel.lower() if args.hw_accel.lower() != "none" else ""
+    raw_hw = args.hw_accel.lower()
+    if raw_hw in ("auto", ""):
+        hw_accel = _detect_hw_accel(ffmpeg)
+        label = HW_ACCEL_LABELS.get(hw_accel, "software")
+        print(f"HW accel: auto-detected → {label}")
+    elif raw_hw == "none":
+        hw_accel = ""
+    else:
+        hw_accel = raw_hw
     if hw_accel and hw_accel not in HW_ACCEL_BACKENDS:
         print(f"Error: Unknown hw-accel backend '{hw_accel}'.  "
-              f"Valid: {', '.join(HW_ACCEL_BACKENDS)} or 'none'.", file=sys.stderr)
+              f"Valid: auto, none, {', '.join(HW_ACCEL_BACKENDS)}.", file=sys.stderr)
         return 1
 
     # ── collect jobs ──────────────────────────────────────────────────────────
